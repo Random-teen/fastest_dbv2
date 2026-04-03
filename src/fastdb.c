@@ -95,7 +95,7 @@ static char *make_path(const char *base, const char *ext) {
 #define INITIAL_MAP_SIZE  (256ULL * 1024 * 1024)  /* 256 MB initial */
 #define GROW_INCREMENT    (256ULL * 1024 * 1024)
 
-static fastdb_err_t ensure_map_size(fastdb_t *db, size_t needed) {
+fastdb_err_t fastdb_ensure_map_size(fastdb_t *db, size_t needed) {
     if (needed <= db->data_map_size)
         return FASTDB_OK;
 
@@ -124,6 +124,11 @@ static fastdb_err_t index_init(fastdb_t *db, uint64_t buckets) {
     db->index_mask = buckets - 1;
     db->index = calloc(buckets, sizeof(uint64_t));
     if (!db->index) return FASTDB_ERR_NOMEM;
+    /* Pre-touch pages to avoid page faults during operation */
+    volatile uint64_t sum = 0;
+    for (uint64_t i = 0; i < buckets; i += 512)
+        sum += db->index[i];
+    (void)sum;
     return FASTDB_OK;
 }
 
@@ -247,8 +252,13 @@ static fastdb_err_t wal_flush(fastdb_t *db) {
  * ============================================================ */
 
 fastdb_err_t fastdb_open(fastdb_t **out, const char *path) {
+    return fastdb_open_ex(out, path, FASTDB_FLAG_DEFAULT);
+}
+
+fastdb_err_t fastdb_open_ex(fastdb_t **out, const char *path, uint32_t flags) {
     fastdb_t *db = calloc(1, sizeof(fastdb_t));
     if (!db) return FASTDB_ERR_NOMEM;
+    db->flags = flags;
 
     db->path = strdup(path);
     if (!db->path) { free(db); return FASTDB_ERR_NOMEM; }
@@ -275,20 +285,26 @@ fastdb_err_t fastdb_open(fastdb_t **out, const char *path) {
     if (st.st_size < (off_t)FASTDB_PAGE_SIZE) {
         /* New database */
         is_new = true;
-        if (ftruncate(db->data_fd, INITIAL_MAP_SIZE) < 0) goto err_io;
-        db->data_map_size = INITIAL_MAP_SIZE;
+        size_t init_size = INITIAL_MAP_SIZE;
+        if (ftruncate(db->data_fd, init_size) < 0) goto err_io;
+        db->data_map_size = init_size;
     } else {
         db->data_map_size = ALIGN_UP(st.st_size, FASTDB_PAGE_SIZE);
     }
 
-    /* mmap */
+    /* mmap — turbo mode uses MAP_PRIVATE + POPULATE for max write speed */
+    int mmap_flags = MAP_SHARED;
+    if (flags & FASTDB_FLAG_TURBO) {
+        mmap_flags = MAP_PRIVATE | MAP_POPULATE;
+    }
     db->data_map = mmap(NULL, db->data_map_size,
                         PROT_READ | PROT_WRITE,
-                        MAP_SHARED, db->data_fd, 0);
+                        mmap_flags, db->data_fd, 0);
     if (db->data_map == MAP_FAILED) goto err_mmap;
 
-    /* Advise sequential for initial load, then random */
     madvise(db->data_map, db->data_map_size, MADV_RANDOM);
+    if (flags & FASTDB_FLAG_TURBO)
+        madvise(db->data_map, db->data_map_size, MADV_HUGEPAGE);
 
     db->header = (fastdb_header_t *)db->data_map;
 
@@ -306,7 +322,12 @@ fastdb_err_t fastdb_open(fastdb_t **out, const char *path) {
         if (db->header->data_end > db->data_map_size) goto err_corrupt;
     }
 
-    /* Initialize hash index */
+    /* Initialize hash index — turbo mode uses smaller initial size for cache efficiency */
+    uint64_t init_buckets = db->header->index_buckets;
+    if (is_new && (flags & FASTDB_FLAG_TURBO) && init_buckets > (1 << 18))
+        init_buckets = (1 << 18);  /* 256K buckets (2MB) fits in L2/L3 */
+    if (is_new)
+        db->header->index_buckets = init_buckets;
     fastdb_err_t rc = index_init(db, db->header->index_buckets);
     if (rc != FASTDB_OK) goto err_nomem;
 
@@ -374,14 +395,29 @@ fastdb_err_t fastdb_close(fastdb_t *db) {
     if (!db) return FASTDB_ERR_INVALID;
 
     /* Flush WAL */
-    wal_flush(db);
+    if (!(db->flags & FASTDB_FLAG_NO_WAL))
+        wal_flush(db);
 
     /* Update header */
     db->header->wal_lsn = db->wal_lsn;
     db->header->modified_ts = now_epoch();
 
-    /* Sync and unmap */
-    msync(db->data_map, db->data_map_size, MS_SYNC);
+    /* For turbo mode (MAP_PRIVATE), write data back to file */
+    if (db->flags & FASTDB_FLAG_TURBO) {
+        lseek(db->data_fd, 0, SEEK_SET);
+        size_t data_end = db->header->data_end;
+        size_t written = 0;
+        while (written < data_end) {
+            size_t chunk = data_end - written;
+            if (chunk > (4ULL * 1024 * 1024)) chunk = 4ULL * 1024 * 1024;
+            ssize_t w = write(db->data_fd, (uint8_t *)db->data_map + written, chunk);
+            if (w <= 0) break;
+            written += w;
+        }
+        fsync(db->data_fd);
+    } else {
+        msync(db->data_map, db->data_map_size, MS_SYNC);
+    }
     munmap(db->data_map, db->data_map_size);
 
     if (db->lock_fd >= 0) {
@@ -447,7 +483,7 @@ static uint64_t alloc_record(fastdb_t *db, uint32_t key_len, uint32_t val_len) {
     uint64_t offset = db->header->data_end;
     uint64_t new_end = offset + rec_size;
 
-    if (ensure_map_size(db, new_end) != FASTDB_OK)
+    if (fastdb_ensure_map_size(db, new_end) != FASTDB_OK)
         return OFFSET_NONE;
 
     db->header->data_end = new_end;
@@ -468,8 +504,10 @@ fastdb_err_t fastdb_put(fastdb_t *db,
         return FASTDB_ERR_INVALID;
 
     uint64_t hash = HASH(key->data, key->len);
+    uint32_t flags = db->flags;
 
-    pthread_rwlock_wrlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_wrlock(&db->rw_lock);
 
     /* Check for existing key — update in place if possible */
     uint64_t existing_offset;
@@ -480,17 +518,20 @@ fastdb_err_t fastdb_put(fastdb_t *db,
         /* If value fits in existing slot, update in place */
         if (value_len <= existing->val_len) {
             void *val_ptr = (uint8_t *)existing + FASTDB_RECORD_HDR_SIZE + existing->key_len;
-            MEMCPY_NT(val_ptr, value, value_len);
+            memcpy(val_ptr, value, value_len);
             existing->val_len = value_len;
             existing->type = type;
-            existing->timestamp = atomic_fetch_add(&db->version_counter, 1);
-            existing->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
+            if (!(flags & FASTDB_FLAG_NO_STATS))
+                existing->timestamp = atomic_fetch_add(&db->version_counter, 1);
+            if (!(flags & FASTDB_FLAG_NO_CRC))
+                existing->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
 
-            atomic_fetch_add(&db->stat_writes, 1);
-            pthread_rwlock_unlock(&db->rw_lock);
-
-            /* WAL (async, after unlock for speed — acceptable for most workloads) */
-            wal_write(db, WAL_OP_PUT, key, value, value_len, type);
+            if (!(flags & FASTDB_FLAG_NO_STATS))
+                atomic_fetch_add(&db->stat_writes, 1);
+            if (!(flags & FASTDB_FLAG_NO_LOCK))
+                pthread_rwlock_unlock(&db->rw_lock);
+            if (!(flags & FASTDB_FLAG_NO_WAL))
+                wal_write(db, WAL_OP_PUT, key, value, value_len, type);
             return FASTDB_OK;
         }
         /* Mark old as deleted, insert new */
@@ -500,7 +541,8 @@ fastdb_err_t fastdb_put(fastdb_t *db,
     /* Allocate new record */
     uint64_t offset = alloc_record(db, key->len, value_len);
     if (offset == OFFSET_NONE) {
-        pthread_rwlock_unlock(&db->rw_lock);
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
         return FASTDB_ERR_FULL;
     }
 
@@ -510,10 +552,13 @@ fastdb_err_t fastdb_put(fastdb_t *db,
     rec->val_len = value_len;
     rec->type = type;
     rec->flags = 0;
-    rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
-    rec->checksum = CRC64(key->data, key->len);
-    if (value && value_len > 0)
-        rec->checksum ^= CRC64(value, value_len);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
+    if (!(flags & FASTDB_FLAG_NO_CRC)) {
+        rec->checksum = CRC64(key->data, key->len);
+        if (value && value_len > 0)
+            rec->checksum ^= CRC64(value, value_len);
+    }
 
     /* Copy key */
     uint8_t *key_dst = (uint8_t *)rec + FASTDB_RECORD_HDR_SIZE;
@@ -522,7 +567,7 @@ fastdb_err_t fastdb_put(fastdb_t *db,
     /* Copy value */
     if (value && value_len > 0) {
         uint8_t *val_dst = key_dst + key->len;
-        MEMCPY_NT(val_dst, value, value_len);
+        memcpy(val_dst, value, value_len);
     }
 
     /* Insert into index */
@@ -532,7 +577,8 @@ fastdb_err_t fastdb_put(fastdb_t *db,
 
     if (!is_replace)
         db->header->record_count++;
-    atomic_fetch_add(&db->stat_writes, 1);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        atomic_fetch_add(&db->stat_writes, 1);
 
     /* Resize index if load factor > 0.75 */
     double load = (double)db->header->record_count / db->index_buckets;
@@ -541,9 +587,10 @@ fastdb_err_t fastdb_put(fastdb_t *db,
         db->header->index_buckets = db->index_buckets;
     }
 
-    pthread_rwlock_unlock(&db->rw_lock);
-
-    wal_write(db, WAL_OP_PUT, key, value, value_len, type);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_unlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_WAL))
+        wal_write(db, WAL_OP_PUT, key, value, value_len, type);
     return FASTDB_OK;
 }
 
@@ -558,16 +605,22 @@ fastdb_err_t fastdb_get(fastdb_t *db,
         return FASTDB_ERR_INVALID;
 
     uint64_t hash = HASH(key->data, key->len);
+    uint32_t flags = db->flags;
 
-    pthread_rwlock_rdlock(&db->rw_lock);
-    atomic_fetch_add(&db->active_readers, 1);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_rdlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        atomic_fetch_add(&db->active_readers, 1);
 
     fastdb_record_t *rec = find_record(db, key, hash, NULL);
 
     if (!rec) {
-        atomic_fetch_sub(&db->active_readers, 1);
-        pthread_rwlock_unlock(&db->rw_lock);
-        atomic_fetch_add(&db->stat_cache_misses, 1);
+        if (!(flags & FASTDB_FLAG_NO_STATS))
+            atomic_fetch_sub(&db->active_readers, 1);
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
+        if (!(flags & FASTDB_FLAG_NO_STATS))
+            atomic_fetch_add(&db->stat_cache_misses, 1);
         return FASTDB_ERR_NOT_FOUND;
     }
 
@@ -576,10 +629,13 @@ fastdb_err_t fastdb_get(fastdb_t *db,
     out->data.len = rec->val_len;
     out->timestamp = rec->timestamp;
 
-    atomic_fetch_add(&db->stat_reads, 1);
-    atomic_fetch_add(&db->stat_cache_hits, 1);
-    atomic_fetch_sub(&db->active_readers, 1);
-    pthread_rwlock_unlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_STATS)) {
+        atomic_fetch_add(&db->stat_reads, 1);
+        atomic_fetch_add(&db->stat_cache_hits, 1);
+        atomic_fetch_sub(&db->active_readers, 1);
+    }
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_unlock(&db->rw_lock);
 
     return FASTDB_OK;
 }
@@ -594,26 +650,31 @@ fastdb_err_t fastdb_delete(fastdb_t *db,
         return FASTDB_ERR_INVALID;
 
     uint64_t hash = HASH(key->data, key->len);
+    uint32_t flags = db->flags;
 
-    pthread_rwlock_wrlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_wrlock(&db->rw_lock);
 
     uint64_t offset;
     fastdb_record_t *rec = find_record(db, key, hash, &offset);
 
     if (!rec) {
-        pthread_rwlock_unlock(&db->rw_lock);
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
         return FASTDB_ERR_NOT_FOUND;
     }
 
-    /* Tombstone: mark as deleted */
     rec->flags |= 0x01;
-    rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
     db->header->record_count--;
 
-    atomic_fetch_add(&db->stat_deletes, 1);
-    pthread_rwlock_unlock(&db->rw_lock);
-
-    wal_write(db, WAL_OP_DELETE, key, NULL, 0, 0);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        atomic_fetch_add(&db->stat_deletes, 1);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_unlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_WAL))
+        wal_write(db, WAL_OP_DELETE, key, NULL, 0, 0);
     return FASTDB_OK;
 }
 
@@ -629,26 +690,34 @@ fastdb_err_t fastdb_update(fastdb_t *db,
         return FASTDB_ERR_INVALID;
 
     uint64_t hash = HASH(key->data, key->len);
+    uint32_t flags = db->flags;
 
-    pthread_rwlock_wrlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_wrlock(&db->rw_lock);
 
     fastdb_record_t *rec = find_record(db, key, hash, NULL);
     if (!rec) {
-        pthread_rwlock_unlock(&db->rw_lock);
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
         return FASTDB_ERR_NOT_FOUND;
     }
 
     /* In-place if fits */
     if (value_len <= rec->val_len) {
         void *val_ptr = (uint8_t *)rec + FASTDB_RECORD_HDR_SIZE + rec->key_len;
-        MEMCPY_NT(val_ptr, value, value_len);
+        memcpy(val_ptr, value, value_len);
         rec->val_len = value_len;
         rec->type = type;
-        rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
-        rec->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
-        atomic_fetch_add(&db->stat_writes, 1);
-        pthread_rwlock_unlock(&db->rw_lock);
-        wal_write(db, WAL_OP_PUT, key, value, value_len, type);
+        if (!(flags & FASTDB_FLAG_NO_STATS))
+            rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
+        if (!(flags & FASTDB_FLAG_NO_CRC))
+            rec->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
+        if (!(flags & FASTDB_FLAG_NO_STATS))
+            atomic_fetch_add(&db->stat_writes, 1);
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
+        if (!(flags & FASTDB_FLAG_NO_WAL))
+            wal_write(db, WAL_OP_PUT, key, value, value_len, type);
         return FASTDB_OK;
     }
 
@@ -657,8 +726,9 @@ fastdb_err_t fastdb_update(fastdb_t *db,
 
     uint64_t new_offset = alloc_record(db, key->len, value_len);
     if (new_offset == OFFSET_NONE) {
-        rec->flags &= ~0x01;  /* rollback */
-        pthread_rwlock_unlock(&db->rw_lock);
+        rec->flags &= ~0x01;
+        if (!(flags & FASTDB_FLAG_NO_LOCK))
+            pthread_rwlock_unlock(&db->rw_lock);
         return FASTDB_ERR_FULL;
     }
 
@@ -668,21 +738,25 @@ fastdb_err_t fastdb_update(fastdb_t *db,
     new_rec->val_len = value_len;
     new_rec->type = type;
     new_rec->flags = 0;
-    new_rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
-    new_rec->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        new_rec->timestamp = atomic_fetch_add(&db->version_counter, 1);
+    if (!(flags & FASTDB_FLAG_NO_CRC))
+        new_rec->checksum = CRC64(key->data, key->len) ^ CRC64(value, value_len);
 
     memcpy((uint8_t *)new_rec + FASTDB_RECORD_HDR_SIZE, key->data, key->len);
-    MEMCPY_NT((uint8_t *)new_rec + FASTDB_RECORD_HDR_SIZE + key->len,
+    memcpy((uint8_t *)new_rec + FASTDB_RECORD_HDR_SIZE + key->len,
               value, value_len);
 
     uint64_t bucket = index_bucket(db, hash);
     new_rec->next_offset = db->index[bucket];
     db->index[bucket] = new_offset;
 
-    atomic_fetch_add(&db->stat_writes, 1);
-    pthread_rwlock_unlock(&db->rw_lock);
-
-    wal_write(db, WAL_OP_PUT, key, value, value_len, type);
+    if (!(flags & FASTDB_FLAG_NO_STATS))
+        atomic_fetch_add(&db->stat_writes, 1);
+    if (!(flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_unlock(&db->rw_lock);
+    if (!(flags & FASTDB_FLAG_NO_WAL))
+        wal_write(db, WAL_OP_PUT, key, value, value_len, type);
     return FASTDB_OK;
 }
 
@@ -697,10 +771,12 @@ fastdb_err_t fastdb_exists(fastdb_t *db,
 
     uint64_t hash = HASH(key->data, key->len);
 
-    pthread_rwlock_rdlock(&db->rw_lock);
+    if (!(db->flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_rdlock(&db->rw_lock);
     fastdb_record_t *rec = find_record(db, key, hash, NULL);
     *exists = (rec != NULL);
-    pthread_rwlock_unlock(&db->rw_lock);
+    if (!(db->flags & FASTDB_FLAG_NO_LOCK))
+        pthread_rwlock_unlock(&db->rw_lock);
 
     return FASTDB_OK;
 }
@@ -845,7 +921,7 @@ fastdb_err_t fastdb_batch_put(fastdb_t *db,
     }
 
     uint64_t start_offset = db->header->data_end;
-    if (ensure_map_size(db, start_offset + total_needed) != FASTDB_OK) {
+    if (fastdb_ensure_map_size(db, start_offset + total_needed) != FASTDB_OK) {
         pthread_rwlock_unlock(&db->rw_lock);
         return FASTDB_ERR_FULL;
     }

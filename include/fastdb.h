@@ -37,6 +37,14 @@ extern "C" {
 #define FASTDB_SLAB_CLASSES     32
 #define FASTDB_MAX_READERS      256
 
+/* Open flags for fastdb_open_ex() */
+#define FASTDB_FLAG_DEFAULT     0x00
+#define FASTDB_FLAG_NO_WAL      0x01   /* skip WAL writes (faster, less durable) */
+#define FASTDB_FLAG_NO_CRC      0x02   /* skip CRC checksums */
+#define FASTDB_FLAG_NO_LOCK     0x04   /* skip rwlock (single-threaded only) */
+#define FASTDB_FLAG_NO_STATS    0x08   /* skip atomic stat counters */
+#define FASTDB_FLAG_TURBO       0x0F   /* all fast flags combined */
+
 /* ============================================================
  * Error codes
  * ============================================================ */
@@ -196,6 +204,9 @@ typedef struct {
     /* Path */
     char        *path;
 
+    /* Mode flags */
+    uint32_t     flags;
+
     /* Stats */
     _Atomic uint64_t stat_reads;
     _Atomic uint64_t stat_writes;
@@ -231,6 +242,7 @@ typedef bool (*fastdb_scan_cb)(const fastdb_slice_t *key,
 
 /* Lifecycle */
 fastdb_err_t fastdb_open(fastdb_t **db, const char *path);
+fastdb_err_t fastdb_open_ex(fastdb_t **db, const char *path, uint32_t flags);
 fastdb_err_t fastdb_close(fastdb_t *db);
 fastdb_err_t fastdb_destroy(const char *path);
 
@@ -294,6 +306,117 @@ typedef struct {
 } fastdb_stats_t;
 
 fastdb_err_t fastdb_stats(fastdb_t *db, fastdb_stats_t *stats);
+
+/* Assembly-accelerated hash (forward decl for inline functions below) */
+extern uint64_t fastdb_hash_asm(const void *data, uint32_t len);
+
+/* ensure_map_size (forward decl for inline growth) */
+extern fastdb_err_t fastdb_ensure_map_size(fastdb_t *db, size_t needed);
+
+/* Inline ultra-fast operations for turbo mode (no WAL, no CRC, no lock, no stats) */
+static inline fastdb_err_t fastdb_put_turbo(fastdb_t *db,
+                                             const void *key_data, uint32_t key_len,
+                                             const void *val_data, uint32_t val_len,
+                                             fastdb_type_t type) {
+    uint64_t hash = fastdb_hash_asm(key_data, key_len);
+    uint64_t bucket = hash & db->index_mask;
+    uint64_t offset = db->index[bucket];
+
+    /* Check for existing key — update in place */
+    while (offset != 0ULL) {
+        fastdb_record_t *rec = (fastdb_record_t *)((uint8_t *)db->data_map + offset);
+        if (rec->hash == hash && rec->key_len == key_len && !(rec->flags & 0x01)) {
+            if (__builtin_expect(memcmp((uint8_t *)rec + sizeof(fastdb_record_t),
+                                        key_data, key_len) == 0, 1)) {
+                if (val_len <= rec->val_len) {
+                    memcpy((uint8_t *)rec + sizeof(fastdb_record_t) + key_len,
+                           val_data, val_len);
+                    rec->val_len = val_len;
+                    rec->type = type;
+                    return 0;
+                }
+                rec->flags |= 0x01;
+                break;
+            }
+        }
+        offset = rec->next_offset;
+    }
+
+    /* Allocate new record */
+    uint64_t rec_size = (sizeof(fastdb_record_t) + key_len + val_len + 15ULL) & ~15ULL;
+    uint64_t new_offset = db->header->data_end;
+    uint64_t new_end = new_offset + rec_size;
+
+    if (__builtin_expect(new_end > db->data_map_size, 0)) {
+        if (fastdb_ensure_map_size(db, new_end) != FASTDB_OK)
+            return FASTDB_ERR_FULL;
+    }
+
+    db->header->data_end = new_end;
+
+    fastdb_record_t *rec = (fastdb_record_t *)((uint8_t *)db->data_map + new_offset);
+    rec->hash = hash;
+    rec->key_len = key_len;
+    rec->val_len = val_len;
+    rec->type = type;
+    rec->flags = 0;
+    rec->timestamp = 0;
+    rec->checksum = 0;
+
+    memcpy((uint8_t *)rec + sizeof(fastdb_record_t), key_data, key_len);
+    memcpy((uint8_t *)rec + sizeof(fastdb_record_t) + key_len, val_data, val_len);
+
+    rec->next_offset = db->index[bucket];
+    db->index[bucket] = new_offset;
+
+    db->header->record_count++;
+    return 0;
+}
+
+static inline fastdb_err_t fastdb_get_turbo(fastdb_t *db,
+                                             const void *key_data, uint32_t key_len,
+                                             const void **out_data, uint32_t *out_len,
+                                             fastdb_type_t *out_type) {
+    uint64_t hash = fastdb_hash_asm(key_data, key_len);
+    uint64_t bucket = hash & db->index_mask;
+    uint64_t offset = db->index[bucket];
+
+    while (offset != 0ULL) {
+        fastdb_record_t *rec = (fastdb_record_t *)((uint8_t *)db->data_map + offset);
+        if (rec->hash == hash && rec->key_len == key_len && !(rec->flags & 0x01)) {
+            if (__builtin_expect(memcmp((uint8_t *)rec + sizeof(fastdb_record_t),
+                                        key_data, key_len) == 0, 1)) {
+                *out_data = (uint8_t *)rec + sizeof(fastdb_record_t) + key_len;
+                *out_len = rec->val_len;
+                *out_type = rec->type;
+                return 0;
+            }
+        }
+        offset = rec->next_offset;
+    }
+    return FASTDB_ERR_NOT_FOUND;
+}
+
+static inline fastdb_err_t fastdb_delete_turbo(fastdb_t *db,
+                                                const void *key_data, uint32_t key_len) {
+    uint64_t hash = fastdb_hash_asm(key_data, key_len);
+    uint64_t bucket = hash & db->index_mask;
+    uint64_t offset = db->index[bucket];
+
+    while (offset != 0ULL) {
+        fastdb_record_t *rec = (fastdb_record_t *)((uint8_t *)db->data_map + offset);
+        if (rec->hash == hash && rec->key_len == key_len && !(rec->flags & 0x01)) {
+            if (memcmp((uint8_t *)rec + sizeof(fastdb_record_t),
+                       key_data, key_len) == 0) {
+                rec->flags |= 0x01;
+                db->header->record_count--;
+                return 0;
+            }
+        }
+        offset = rec->next_offset;
+    }
+    return FASTDB_ERR_NOT_FOUND;
+}
 
 /* ============================================================
  * Assembly-accelerated functions (x86-64)
