@@ -10,7 +10,10 @@ import struct
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 import fastdb
-from fastdb.database import NotFoundError
+try:
+    from fastdb._fastdb_ext import NotFoundError
+except ImportError:
+    from fastdb.database import NotFoundError
 
 DB_PATH = None
 db = None
